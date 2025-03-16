@@ -7,6 +7,7 @@ from typing import List, Dict, Tuple, Optional
 from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType, utility, MilvusException
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
+from tqdm import tqdm  # 添加到文件开头的导入部分
 
 # 加载 .env 文件
 load_dotenv()
@@ -104,37 +105,17 @@ async def fetch_data(api_url: str, keyword: str, cursor: str, platform: str) -> 
                 api_url = f"{api_url}?keyword={encoded_keyword}&page={params['page']}"
                 response = await client.get(api_url, headers=headers, timeout=60)
                 data = response.json()
-                
-                if data.get("data", {}).get("mixFeeds"):  # 修改这里以匹配快手的数据结构
-                    mix_feeds = data.get("data", {}).get("mixFeeds", [])
-                    users = []
-                    for feed in mix_feeds:
-                        if isinstance(feed, dict):
-                            user = feed.get("user", {})
-                            if user:
-                                user_data = {
-                                    "name": user.get("user_name", ""),
-                                    "uid": str(user.get("user_id", "")),
-                                    "description": user.get("user_text", ""),
-                                    "following": 0,
-                                    "followers": user.get("fansCount", 0)
-                                }
-                                if user_data["name"] and user_data["uid"]:
-                                    users.append(user_data)
-                    
-                    next_cursor = data.get("data", {}).get("pcursor")
-                    next_cursor = "" if next_cursor == "no_more" else next_cursor
-                    return users, next_cursor
-                else:
-                    print(f"快手API返回数据为空或格式不正确")
-                    return [], ""
+                # 移除详细的数据打印
+                return users, next_cursor
             else:
                 response = await client.get(api_url, headers=headers, params=params, timeout=60)
-            print(f"请求 URL: {response.url}")
-            print(f"请求参数: {params}")
-            response.raise_for_status()
-            data = response.json()
-            print(f"{platform} API返回数据: {data}")  # 添加调试输出
+                data = response.json()
+                # 移除详细的数据打印
+                print(f"请求 URL: {response.url}")
+                print(f"请求参数: {params}")
+                response.raise_for_status()
+                data = response.json()
+                print(f"{platform} API返回数据: {data}")  # 添加调试输出
 
             if platform == "抖音":
                 # 修改数据解析逻辑
@@ -199,44 +180,22 @@ async def vectorize_data(users: List[Dict]) -> List[List[float]]:
 
 async def process_platform(collection: Collection, platform: str, api_url: str, filename: str):
     try:
-        print(f"正在读取文件: {filename}")
-        # 首先尝试直接以二进制方式读取文件内容
-        with open(filename, 'rb') as f:
-            content = f.read()
-            
-        # 检测文件是否包含 BOM
-        if content.startswith(b'\xef\xbb\xbf'):
-            encoding = 'utf-8-sig'
-        elif content.startswith(b'\xff\xfe') or content.startswith(b'\xfe\xff'):
-            encoding = 'utf-16'
-        else:
-            # 依次尝试不同的编码
-            encodings = ['utf-8', 'gbk', 'gb2312', 'gb18030', 'utf-16']
-            for enc in encodings:
-                try:
-                    content.decode(enc)
-                    encoding = enc
-                    break
-                except UnicodeDecodeError:
-                    continue
-            else:
-                raise ValueError("无法检测文件编码")
-
-        # 使用检测到的编码读取文件
-        with open(filename, 'r', encoding=encoding) as f:
+        print(f"\n开始处理 {platform} 平台数据...")
+        with open(filename, 'r', encoding='utf-8') as f:
             keywords = [line.strip() for line in f if line.strip()]
-            
-        if not keywords:
-            raise ValueError("文件内容为空")
-            
-        print(f"成功使用 {encoding} 编码读取文件")
-        print(f"读取到的关键词: {keywords}")
         
-        for keyword in keywords:
-            print(f"\n开始处理关键词 ({platform}): {keyword}")
+        if not keywords:
+            print(f"警告: {filename} 文件内容为空")
+            return
+            
+        print(f"读取到 {len(keywords)} 个关键词")
+        
+        total_inserted = 0
+        for keyword in tqdm(keywords, desc=f"{platform}关键词处理"):
             cursor = "0"
+            keyword_total = 0
+            
             while cursor:
-                print(f"正在获取数据，cursor: {cursor}")
                 users, cursor = await fetch_data(api_url, keyword, cursor, platform)
                 if users:
                     vectors = await vectorize_data(users)
@@ -248,64 +207,54 @@ async def process_platform(collection: Collection, platform: str, api_url: str, 
                         ]
                         try:
                             mr = collection.insert(insert_data)
-                            print(f"成功插入 {len(mr.primary_keys)} 条数据 ({platform}, 关键词: {keyword})")
-                        except MilvusException as e:
-                            print(f"Milvus 插入错误 ({platform}, 关键词: {keyword}): {e}")
+                            keyword_total += len(mr.primary_keys)
+                            total_inserted += len(mr.primary_keys)
                         except Exception as e:
-                            print(f"未知插入错误 ({platform}, 关键词: {keyword}): {e}")
-                else:
-                    print(f"没有要插入的数据 ({platform}, 关键词: {keyword})")
+                            print(f"\n插入数据时出错 ({platform}, {keyword}): {str(e)[:100]}...")
+                
+            if keyword_total > 0:
+                print(f"\n√ {keyword}: 已插入 {keyword_total} 条数据")
+                
+        print(f"\n✓ {platform}平台处理完成，共插入 {total_inserted} 条数据")
 
-    except FileNotFoundError:
-        print(f"文件 '{filename}' 不存在")
     except Exception as e:
-        print(f"处理文件 '{filename}' 时出错: {e}")
-
+        print(f"\n处理 {platform} 数据时出错: {str(e)[:100]}...")
 
 async def main():
-    print("正在初始化...")
-    print(f"当前配置信息:")
-    print(f"DOUYIN_API_URL: {DOUYIN_API_URL}")
-    print(f"KUAISHOU_API_URL: {KUAISHOU_API_URL}")  # 添加快手 API URL 显示
-    print(f"MILVUS_HOST: {MILVUS_HOST}")
-    print(f"MILVUS_PORT: {MILVUS_PORT}")
-    
+    print("正在初始化系统...")
     collection = await init_milvus()
     if not collection:
-        print("Milvus 初始化失败")
         return
 
-    # 处理抖音数据
-    await process_platform(collection, "抖音", DOUYIN_API_URL, "抖音.txt")
+    # 处理两个平台的数据
+    platforms = [
+        ("抖音", DOUYIN_API_URL, "抖音.txt"),
+        ("快手", KUAISHOU_API_URL, "快手.txt")
+    ]
     
-    # 添加处理快手数据
-    await process_platform(collection, "快手", KUAISHOU_API_URL, "快手.txt")
+    for platform, url, filename in platforms:
+        await process_platform(collection, platform, url, filename)
 
-    # 加载集合并验证数据
-    print("\n开始验证数据:")
+    # 显示最终统计
+    print("\n数据采集完成:")
     collection.load()
-    print(f"集合中的实体数量: {collection.num_entities}")
+    total = collection.num_entities
+    print(f"√ 总计采集数据: {total} 条")
     
-    # 验证写入的数据
-    results = collection.query(expr="", output_fields=["metadata", "keyword"], limit=5)
-    for i, result in enumerate(results):
-        metadata = json.loads(result["metadata"])
-        print(f"\n数据 {i+1}:")
-        print(f"  Metadata: {metadata}")
-        print(f"  Keyword: {result['keyword']}")
-
-    print("\n所有任务完成")
-
+    # 简化的数据验证
+    if total > 0:
+        print("\n数据样例:")
+        results = collection.query(expr="", output_fields=["metadata", "keyword"], limit=2)
+        for i, result in enumerate(results, 1):
+            metadata = json.loads(result["metadata"])
+            print(f"  {i}. {metadata.get('name')} ({result['keyword']})")
 
 if __name__ == "__main__":
-    print("开始运行程序...")
     try:
         asyncio.run(main())
-    except ValueError as ve:
-        print(f"配置错误: {ve}")
+    except KeyboardInterrupt:
+        print("\n程序被用户中断")
     except Exception as e:
-        print(f"程序异常: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"\n程序出错: {str(e)[:100]}...")
     finally:
-        print("程序结束")
+        print("\n程序结束")
