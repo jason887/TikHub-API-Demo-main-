@@ -187,16 +187,47 @@ async def main():
     try:
         collection = init_milvus()
         
-        # 从文件中读取的数据
-        photo_id = "3x6d7yzqcdcyib4"  # 第一列
-        video_author_id = "3xdujsv23wwt4w2"  # 第二列
-        video_author_name = "铜盂肥叔牛肉导导"  # 第三列
+        # 获取已存在的 photo_id 列表
+        existing_photos = set()
+        try:
+            res = collection.query(
+                expr="photo_id != ''",
+                output_fields=["photo_id"]
+            )
+            existing_photos = set(item['photo_id'] for item in res)
+            print(f"数据库中已存在 {len(existing_photos)} 个视频的评论")
+        except Exception as e:
+            print(f"查询现有数据时出错: {str(e)}")
         
-        print(f"正在处理视频 ID: {photo_id}")
-        print(f"视频作者 ID: {video_author_id}")
-        print(f"视频作者昵称: {video_author_name}")
-        
-        await fetch_video_comments(photo_id, collection, video_author_id, video_author_name)
+        # 从文件中读取数据
+        comment_file_path = "e:\\TikHub-API-Demo-main\\快手作品评论.txt"
+        with open(comment_file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # 分割行数据
+                parts = line.split()
+                if len(parts) >= 3:
+                    photo_id = parts[0]
+                    video_author_id = parts[1]
+                    video_author_name = parts[2]
+                    
+                    # 检查是否已存在
+                    if photo_id in existing_photos:
+                        print(f"\n视频 {photo_id} 的评论已存在，跳过")
+                        continue
+                    
+                    print(f"\n正在处理新视频 ID: {photo_id}")
+                    print(f"视频作者 ID: {video_author_id}")
+                    print(f"视频作者昵称: {video_author_name}")
+                    
+                    await fetch_video_comments(photo_id, collection, video_author_id, video_author_name)
+                    # 添加到已处理集合
+                    existing_photos.add(photo_id)
+                else:
+                    print(f"行格式错误，跳过: {line}")
     finally:
         connections.disconnect("default")
 
