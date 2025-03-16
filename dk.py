@@ -41,33 +41,32 @@ model = SentenceTransformer('all-MiniLM-L6-v2')
 async def init_milvus() -> Optional[Collection]:
     try:
         print(f"尝试连接Milvus: {MILVUS_HOST}:{MILVUS_PORT}")
-        # 删除这两行，直接使用全局变量
-        # MILVUS_HOST = "localhost"  # 这里错误地重新定义了局部变量
-        # MILVUS_PORT = "19530"     # 这里错误地重新定义了局部变量
         connections.connect("default", host=MILVUS_HOST, port=MILVUS_PORT)
         print("Milvus连接成功")
 
+        # 检查是否存在旧集合
+        if "user_data" in utility.list_collections():
+            print("检测到现有集合，继续使用...")
+            collection = Collection("user_data")
+            return collection
+
+        # 如果不存在，创建新集合
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
             FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=384),
-            FieldSchema(name="metadata", dtype=DataType.VARCHAR, max_length=500),
+            FieldSchema(name="metadata", dtype=DataType.VARCHAR, max_length=2000),
             FieldSchema(name="keyword", dtype=DataType.VARCHAR, max_length=100),
         ]
         schema = CollectionSchema(fields, "用户数据集合")
-
-        if "user_data" in utility.list_collections():
-            print("集合 'user_data' 已存在，准备删除并重新创建")
-            collection = Collection("user_data")
-            collection.drop()
-
+        
         print("创建新集合 'user_data'")
         collection = Collection("user_data", schema)
-
-        # 创建索引 (在创建集合后立即创建)
+        
+        # 创建索引
         index_params = {
-            "metric_type": "L2",  # 或 "IP" (内积)，根据你的需求选择
-            "index_type": "IVF_FLAT",  # 或其他索引类型，如 HNSW, IVF_SQ8, 等
-            "params": {"nlist": 1024}  # 根据你的数据量调整 nlist
+            "metric_type": "L2",
+            "index_type": "IVF_FLAT",
+            "params": {"nlist": 1024}
         }
         print("为 vector 字段创建索引")
         collection.create_index(field_name="vector", index_params=index_params)
@@ -99,14 +98,42 @@ async def fetch_data(api_url: str, keyword: str, cursor: str, platform: str) -> 
 
     async with httpx.AsyncClient() as client:
         try:
-            # 对于快手 API，确保参数正确编码
             if platform == "快手":
                 encoded_keyword = urllib.parse.quote(params["keyword"])
                 api_url = f"{api_url}?keyword={encoded_keyword}&page={params['page']}"
                 response = await client.get(api_url, headers=headers, timeout=60)
                 data = response.json()
-                # 移除详细的数据打印
-                return users, next_cursor
+                
+                # 添加调试输出
+                print(f"\n快手API返回数据结构: {json.dumps(data, ensure_ascii=False)[:200]}...")
+                
+                if data.get("data", {}).get("mixFeeds"):
+                    mix_feeds = data.get("data", {}).get("mixFeeds", [])
+                    users = []
+                    for feed in mix_feeds:
+                        if isinstance(feed, dict):
+                            user = feed.get("user", {})
+                            if user:
+                                user_data = {
+                                    "name": user.get("user_name", ""),
+                                    "uid": str(user.get("user_id", "")),
+                                    "description": user.get("user_text", ""),
+                                    "following": 0,
+                                    "followers": user.get("fansCount", 0)
+                                }
+                                if user_data["name"] and user_data["uid"]:
+                                    users.append(user_data)
+                    
+                    # 添加调试输出
+                    if not users:
+                        print(f"未能从数据中提取到用户信息，原始数据结构: {json.dumps(mix_feeds[:1], ensure_ascii=False)}")
+                    
+                    next_cursor = str(int(params["page"]) + 1)
+                    next_cursor = "" if not users else next_cursor
+                    return users, next_cursor
+                else:
+                    print(f"快手API返回数据结构不符合预期: {json.dumps(data.get('data', {}), ensure_ascii=False)[:200]}...")
+                    return [], ""
             else:
                 response = await client.get(api_url, headers=headers, params=params, timeout=60)
                 data = response.json()
@@ -226,9 +253,54 @@ async def main():
     if not collection:
         return
 
-    # 处理两个平台的数据
+    # 先显示现有数据统计
+    collection.load()
+    total = collection.num_entities
+    print(f"\n当前数据库统计:")
+    print(f"总数据量: {total} 条")
+
+    # 先处理快手平台
+    print("\n=== 第一阶段：处理快手平台数据 ===")
+    await process_platform(collection, "快手", KUAISHOU_API_URL, "快手.txt")
+
+    # 再处理抖音平台
+    print("\n=== 第二阶段：处理抖音平台数据 ===")
+    await process_platform(collection, "抖音", DOUYIN_API_URL, "抖音.txt")
+
+    # 显示最终统计
+    print("\n=== 最终数据统计 ===")
+    collection.load()
+    final_total = collection.num_entities
+    print(f"√ 总计采集数据: {final_total} 条")
+    
+    if final_total > 0:
+        print("\n数据样例:")
+        results = collection.query(expr="", output_fields=["metadata", "keyword"], limit=2)
+        for i, result in enumerate(results, 1):
+            metadata = json.loads(result["metadata"])
+            print(f"  {i}. {metadata.get('name')} ({result['keyword']})")
+
+    # 查看每个平台的数据量
+    results = collection.query(
+        expr="",
+        output_fields=["keyword"],
+        limit=total
+    )
+    
+    douyin_count = 0
+    kuaishou_count = 0
+    for result in results:
+        if "抖音" in result["keyword"]:
+            douyin_count += 1
+        elif "快手" in result["keyword"]:
+            kuaishou_count += 1
+    
+    print(f"抖音数据: {douyin_count} 条")
+    print(f"快手数据: {kuaishou_count} 条")
+
+    # 只处理快手平台的数据
     platforms = [
-        ("抖音", DOUYIN_API_URL, "抖音.txt"),
+        # ("抖音", DOUYIN_API_URL, "抖音.txt"),  # 暂时注释掉抖音平台
         ("快手", KUAISHOU_API_URL, "快手.txt")
     ]
     
