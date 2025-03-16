@@ -34,7 +34,10 @@ def init_milvus():
             FieldSchema(name="time", dtype=DataType.VARCHAR, max_length=100),
             FieldSchema(name="likes", dtype=DataType.INT64),
             FieldSchema(name="area", dtype=DataType.VARCHAR, max_length=100),
-            FieldSchema(name="is_reply", dtype=DataType.BOOL)  # 添加新字段
+            FieldSchema(name="is_reply", dtype=DataType.BOOL),
+            # 添加新字段
+            FieldSchema(name="video_author_id", dtype=DataType.VARCHAR, max_length=200),
+            FieldSchema(name="video_author_name", dtype=DataType.VARCHAR, max_length=200)
         ]
         schema = CollectionSchema(fields, description="快手视频评论集合")
         collection = Collection(name=collection_name, schema=schema)
@@ -50,7 +53,7 @@ def init_milvus():
     collection.load()
     return collection
 
-async def save_to_milvus(collection, comments, sub_comments_map, photo_id):
+async def save_to_milvus(collection, comments, sub_comments_map, photo_id, video_author_id, video_author_name):
     """保存评论到 Milvus"""
     try:
         print(f"\n开始处理评论数据，共 {len(comments)} 条主评论")
@@ -70,7 +73,9 @@ async def save_to_milvus(collection, comments, sub_comments_map, photo_id):
                     "time": str(comment.get("time", "")),
                     "likes": int(comment.get("likedCount", 0)),
                     "area": str(comment.get("authorArea", "")),
-                    "is_reply": is_reply  # 添加新字段
+                    "is_reply": is_reply,
+                    "video_author_id": str(video_author_id),
+                    "video_author_name": str(video_author_name)
                 }]
                 
                 print(f"\n处理评论: {content[:30]}...")
@@ -92,7 +97,7 @@ async def save_to_milvus(collection, comments, sub_comments_map, photo_id):
                 sub_comments = sub_comments_map[comment_id].get("subComments", [])
                 print(f"发现 {len(sub_comments)} 条子评论")
                 for sub in sub_comments:
-                    process_and_insert_comment(sub)
+                    process_and_insert_comment(sub, True)
                     total_count += 1
         
         # 确保数据写入
@@ -103,7 +108,7 @@ async def save_to_milvus(collection, comments, sub_comments_map, photo_id):
         print(f"保存到 Milvus 时出错: {str(e)}")
         print(f"错误详情: {type(e).__name__}")
 
-async def fetch_video_comments(photo_id: str, collection, pcursor: str = ""):
+async def fetch_video_comments(photo_id: str, collection, video_author_id: str, video_author_name: str, pcursor: str = ""):
     """获取指定视频的评论信息"""
     api_url = "https://api.tikhub.io/api/v1/kuaishou/app/fetch_one_video_comment"
     
@@ -134,7 +139,7 @@ async def fetch_video_comments(photo_id: str, collection, pcursor: str = ""):
                 
                 if root_comments:
                     # 保存到 Milvus
-                    await save_to_milvus(collection, root_comments, sub_comments_map, photo_id)
+                    await save_to_milvus(collection, root_comments, sub_comments_map, photo_id, video_author_id, video_author_name)
                 
                 if not root_comments:
                     if not pcursor:
@@ -168,7 +173,7 @@ async def fetch_video_comments(photo_id: str, collection, pcursor: str = ""):
                 next_cursor = data.get("data", {}).get("pcursor")
                 if next_cursor and next_cursor != "no_more":
                     await asyncio.sleep(1)  # 添加延迟避免请求过快
-                    await fetch_video_comments(photo_id, collection, next_cursor)  # 添加 collection 参数
+                    await fetch_video_comments(photo_id, collection, video_author_id, video_author_name, next_cursor)
                 elif pcursor:
                     print("\n已获取全部评论")
                     
@@ -181,12 +186,17 @@ async def fetch_video_comments(photo_id: str, collection, pcursor: str = ""):
 async def main():
     try:
         collection = init_milvus()
-        photo_id = input("请输入视频 ID (例如: 3x7gxp2zhgjv832): ")
-        if not photo_id:
-            print("视频 ID 不能为空")
-            return
         
-        await fetch_video_comments(photo_id, collection)
+        # 从文件中读取的数据
+        photo_id = "3x6d7yzqcdcyib4"  # 第一列
+        video_author_id = "3xdujsv23wwt4w2"  # 第二列
+        video_author_name = "铜盂肥叔牛肉导导"  # 第三列
+        
+        print(f"正在处理视频 ID: {photo_id}")
+        print(f"视频作者 ID: {video_author_id}")
+        print(f"视频作者昵称: {video_author_name}")
+        
+        await fetch_video_comments(photo_id, collection, video_author_id, video_author_name)
     finally:
         connections.disconnect("default")
 
