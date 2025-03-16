@@ -103,6 +103,31 @@ async def fetch_data(api_url: str, keyword: str, cursor: str, platform: str) -> 
                 encoded_keyword = urllib.parse.quote(params["keyword"])
                 api_url = f"{api_url}?keyword={encoded_keyword}&page={params['page']}"
                 response = await client.get(api_url, headers=headers, timeout=60)
+                data = response.json()
+                
+                if data.get("data", {}).get("mixFeeds"):  # 修改这里以匹配快手的数据结构
+                    mix_feeds = data.get("data", {}).get("mixFeeds", [])
+                    users = []
+                    for feed in mix_feeds:
+                        if isinstance(feed, dict):
+                            user = feed.get("user", {})
+                            if user:
+                                user_data = {
+                                    "name": user.get("user_name", ""),
+                                    "uid": str(user.get("user_id", "")),
+                                    "description": user.get("user_text", ""),
+                                    "following": 0,
+                                    "followers": user.get("fansCount", 0)
+                                }
+                                if user_data["name"] and user_data["uid"]:
+                                    users.append(user_data)
+                    
+                    next_cursor = data.get("data", {}).get("pcursor")
+                    next_cursor = "" if next_cursor == "no_more" else next_cursor
+                    return users, next_cursor
+                else:
+                    print(f"快手API返回数据为空或格式不正确")
+                    return [], ""
             else:
                 response = await client.get(api_url, headers=headers, params=params, timeout=60)
             print(f"请求 URL: {response.url}")
@@ -241,6 +266,7 @@ async def main():
     print("正在初始化...")
     print(f"当前配置信息:")
     print(f"DOUYIN_API_URL: {DOUYIN_API_URL}")
+    print(f"KUAISHOU_API_URL: {KUAISHOU_API_URL}")  # 添加快手 API URL 显示
     print(f"MILVUS_HOST: {MILVUS_HOST}")
     print(f"MILVUS_PORT: {MILVUS_PORT}")
     
@@ -249,8 +275,11 @@ async def main():
         print("Milvus 初始化失败")
         return
 
-    # 暂时只测试抖音
+    # 处理抖音数据
     await process_platform(collection, "抖音", DOUYIN_API_URL, "抖音.txt")
+    
+    # 添加处理快手数据
+    await process_platform(collection, "快手", KUAISHOU_API_URL, "快手.txt")
 
     # 加载集合并验证数据
     print("\n开始验证数据:")
